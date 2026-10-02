@@ -27,10 +27,12 @@
 
 namespace {
 
-constexpr int kImageWidth  = 1920;
-constexpr int kImageHeight = 1080;
-constexpr int kTileSize    = 32;
-constexpr double kBenchmarkDurationSeconds = 10.0; // one benchmark run lasts this long
+constexpr int kRenderWidth  = 3840;
+constexpr int kRenderHeight = 2160;
+constexpr int kWindowWidth  = 1920;
+constexpr int kWindowHeight = 1080;
+constexpr int kTileSize    = 64;
+constexpr int kSamplesPerPixel = 1024; // path-traced samples per pixel (MSAA + BSDF integration)
 
 // ---------------------------------------------------------------------------
 // Camera.
@@ -39,27 +41,31 @@ constexpr double kBenchmarkDurationSeconds = 10.0; // one benchmark run lasts th
 // Only the camera — mapping a pixel to a primary ray — stays here.
 // ---------------------------------------------------------------------------
 
-// Perspective camera at the origin, looking down -Z.
-// Maps the pixel center (x + 0.5, y + 0.5) to a normalized direction,
-// correcting for aspect so the scene renders without distortion.
-Ray generateCameraRay(int x, int y, int width, int height) {
-    const double ndcX = (static_cast<double>(x) + 0.5) / static_cast<double>(width) * 2.0 - 1.0;
-    const double ndcY = (static_cast<double>(y) + 0.5) / static_cast<double>(height) * 2.0 - 1.0;
+// Perspective camera positioned in the world, looking at the sphere field.
+// Maps the sample position (x, y) — integer pixel plus a fractional jitter
+// offset — to a normalized direction, correcting for aspect so the scene
+// renders without distortion.
+const Vec3 kCameraPos{0.0, 4.0, 6.0};
+const Vec3 kCameraTarget{0.0, 6.0, -11.0};
+
+Ray generateCameraRay(double x, double y, int width, int height) {
+    const double ndcX = (x + 0.5) / static_cast<double>(width) * 2.0 - 1.0;
+    const double ndcY = (y + 0.5) / static_cast<double>(height) * 2.0 - 1.0;
     const double aspect = static_cast<double>(width) / static_cast<double>(height);
 
-    // Screen y grows downward, world y grows upward: flip ndcY.
-    return {
-        Vec3{0.0, 0.0, 0.0},
-        Vec3{ndcX * aspect, -ndcY, -1.0}.normalize()
-    };
+    const Vec3 viewDir = (kCameraTarget - kCameraPos).normalize();
+    const Vec3 right   = viewDir.cross(Vec3(0.0, 1.0, 0.0)).normalize();
+    const Vec3 up      = right.cross(viewDir).normalize();
+
+    // Screen y grows downward, world y grows upward: the minus sign flips ndcY.
+    return {kCameraPos, (viewDir + right * (ndcX * aspect) - up * ndcY).normalize()};
 }
 
 [[nodiscard]] uint8_t toByte(double v) {
-    double c = v * 255.0;
-    if (c < 0.0) {
-        c = 0.0;
-    } else if (c > 255.0) {
-        c = 255.0;
+    // Gamma 2.2 encode: perceptual brightening before the 8-bit quantize.
+    const double c = std::pow(std::max(0.0, v), 1.0 / 2.2) * 255.0;
+    if (c > 255.0) {
+        return 255;
     }
     return static_cast<uint8_t>(c + 0.5);
 }
@@ -126,11 +132,11 @@ struct CpuProfile {
 };
 
 constexpr CpuProfile kReferenceCpus[] = {
-    {"AMD Ryzen 9 9950X3D",  88000},
-    {"Intel Core i9-14900K", 75000},
-    {"AMD Ryzen 7 7800X3D",  45000},
-    {"Apple M3 Max",         35000},
-    {"Intel Core i5-13600K", 30000},
+    {"AMD Ryzen 9 9950X3D",  33200},
+    {"Intel Core i9-14900K", 28300},
+    {"AMD Ryzen 7 7800X3D",  17000},
+    {"Apple M3 Max",         13200},
+    {"Intel Core i5-13600K", 11300},
 };
 
 // UI state machine.
@@ -186,7 +192,7 @@ int main() {
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
     glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE); // required on macOS, harmless elsewhere
 
-    GLFWwindow* window = glfwCreateWindow(kImageWidth, kImageHeight, "LinuxBench", nullptr, nullptr);
+    GLFWwindow* window = glfwCreateWindow(kWindowWidth, kWindowHeight, "LinuxBench", nullptr, nullptr);
     if (window == nullptr) {
         std::fprintf(stderr, "LinuxBench: failed to create the window\n");
         glfwTerminate();
@@ -198,15 +204,31 @@ int main() {
     // ----------------------------------------------------------------- ImGui
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
+
+    // HiDPI: ask GLFW for the monitor's content scale (1.0 on a standard
+    // display, 2.0 on a 200% HiDPI one) and scale the whole UI by it.
+    // ImGui does not auto-scale, so without this the text overflows the
+    // fixed-size widgets on HiDPI monitors.
+    float xscale = 1.0f, yscale = 1.0f;
+    glfwGetWindowContentScale(window, &xscale, &yscale);
+    const float scale = xscale;
+    ImGui::GetStyle().ScaleAllSizes(scale);
+
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr; // Benchmark tool: do not scatter imgui.ini files
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     ImGui::StyleColorsDark();
 
+    // HiDPI: scale the default UI font to the monitor's DPI (ImGui's
+    // built-in default is 13px at 100%).
+    ImFontConfig defaultFontCfg;
+    defaultFontCfg.SizePixels = 13.0f * scale;
+    io.Fonts->AddFontDefault(&defaultFontCfg);
+
     // A larger font for the final score readout. The font atlas is built on
     // the first Render(), so every font must be registered before the loop.
     ImFontConfig scoreFontConfig;
-    scoreFontConfig.SizePixels = 56.0f;
+    scoreFontConfig.SizePixels = 56.0f * scale;
     ImFont* scoreFont = io.Fonts->AddFontDefault(&scoreFontConfig);
 
     ImGui_ImplGlfw_InitForOpenGL(window, true);
@@ -219,12 +241,12 @@ int main() {
         return 1;
     }
 
-    std::printf("LinuxBench: %dx%d image, %dx%d tiles, %zu tiles/frame, %u workers, %.0f s run\n",
-                kImageWidth, kImageHeight, kTileSize, kTileSize,
-                static_cast<std::size_t>((kImageWidth + kTileSize - 1) / kTileSize) *
-                static_cast<std::size_t>((kImageHeight + kTileSize - 1) / kTileSize),
-                std::thread::hardware_concurrency(),
-                kBenchmarkDurationSeconds);
+    std::printf("LinuxBench: Render: %dx%d, Window: %dx%d, %dx%d tiles, %zu tiles, %d spp, %u workers — single path-traced frame\n",
+                kRenderWidth, kRenderHeight, kWindowWidth, kWindowHeight, kTileSize, kTileSize,
+                static_cast<std::size_t>((kRenderWidth + kTileSize - 1) / kTileSize) *
+                static_cast<std::size_t>((kRenderHeight + kTileSize - 1) / kTileSize),
+                kSamplesPerPixel,
+                std::thread::hardware_concurrency());
     std::fflush(stdout);
 
     // ----------------------------------------------------------------- Scene
@@ -239,10 +261,10 @@ int main() {
     std::fflush(stdout);
 
     // -------------------------------------------------------------- Rendering
-    Framebuffer framebuffer(kImageWidth, kImageHeight);
+    Framebuffer framebuffer(kRenderWidth, kRenderHeight);
     const std::size_t totalTiles =
-        ((kImageWidth + kTileSize - 1) / kTileSize) *
-        ((kImageHeight + kTileSize - 1) / kTileSize);
+        ((kRenderWidth + kTileSize - 1) / kTileSize) *
+        ((kRenderHeight + kTileSize - 1) / kTileSize);
 
     // Persistent worker pool: threads are spawned here ONCE and joined ONCE
     // in the destructor. Between frames they park on a condition variable
@@ -256,10 +278,8 @@ int main() {
 
     std::thread             renderThread;
     std::atomic<bool>       renderFinished{false};
-    std::atomic<std::size_t> tilesDone{0};          // progress of the current frame (live)
-    std::atomic<int>        completedFrames{0};     // frames finished so far (live, read by the UI)
+    std::atomic<std::size_t> tilesDone{0};          // tile progress of the single frame (live)
     std::chrono::steady_clock::time_point renderStart;
-    std::chrono::steady_clock::time_point renderDeadline; // renderStart + kBenchmarkDurationSeconds
     std::chrono::steady_clock::time_point renderEnd; // written by the render thread, published via renderFinished
     int finalScore = 0;                              // written by the render thread, published via renderFinished
     bool hasResult = false;                          // main-thread-only: a completed run is on display
@@ -268,71 +288,71 @@ int main() {
 
     // Starts the benchmark on a background thread so the UI loop never blocks.
     //
-    // A run lasts kBenchmarkDurationSeconds: full frames are rendered back to
-    // back until the deadline. The worker threads persist across frames —
-    // the pool is created once (see above) and its workers park between
-    // frames — so the OS scheduler never sees per-frame thread churn. Each
-    // frame gets a fresh TileDispatcher; executeFrameAndWait() blocks until
-    // every tile is rendered and all workers are back to sleep, so
-    // completedFrames is only bumped for provably complete frames.
+    // One run renders a single, massive path-traced frame (kSamplesPerPixel
+    // samples per pixel) to completion. The render thread hands a fresh
+    // TileDispatcher to the persistent worker pool; executeFrameAndWait()
+    // blocks until every tile is rendered and all workers are back to sleep,
+    // so the frame is provably complete before the score is computed.
     auto startBenchmark = [&]() {
         framebuffer.clear();
         tilesDone.store(0, std::memory_order_relaxed);
-        completedFrames.store(0, std::memory_order_relaxed);
         renderFinished.store(false, std::memory_order_relaxed);
         renderStart = std::chrono::steady_clock::now();
-        renderDeadline = renderStart +
-                         std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                             std::chrono::duration<double>(kBenchmarkDurationSeconds));
 
         renderThread = std::thread([&]() {
-            // Render frame after frame while the elapsed time is still under
-            // the 10-second budget.
-            while (std::chrono::steady_clock::now() < renderDeadline) {
-                // A fresh work queue for this frame. The worker threads
-                // themselves persist: they were spawned once with the pool
-                // and are simply woken up for each frame.
-                TileDispatcher dispatcher(kImageWidth, kImageHeight, kTileSize);
-                tilesDone.store(0, std::memory_order_relaxed); // restart the frame progress bar
+            // A fresh work queue for this frame. The worker threads
+            // themselves persist: they were spawned once with the pool and
+            // are simply woken up for the frame.
+            TileDispatcher dispatcher(kRenderWidth, kRenderHeight, kTileSize);
 
-                // Wake every worker, let them pull tiles from the dispatcher
-                // and render them, and block until the dispatcher is empty
-                // and all workers are back to sleep: this frame is provably
-                // complete before the counter below is bumped.
-                pool.executeFrameAndWait(dispatcher, [&](std::size_t) {
-                    while (const auto tileOpt = dispatcher.getNextTile()) {
-                        const Tile& tile = *tileOpt;
-                        // Render every pixel of this tile. Row-major order keeps
-                        // the Framebuffer stores cache-friendly.
-                        const int xEnd = tile.x + tile.width;
-                        const int yEnd = tile.y + tile.height;
-                        for (int y = tile.y; y < yEnd; ++y) {
-                            for (int x = tile.x; x < xEnd; ++x) {
-                                const Vec3 color = scene.traceRay(generateCameraRay(x, y, kImageWidth, kImageHeight));
-                                framebuffer.setPixel(x, y,
-                                                     toByte(color.x),
-                                                     toByte(color.y),
-                                                     toByte(color.z));
+            // Wake every worker, let them pull tiles from the dispatcher and
+            // render them, and block until the dispatcher is empty and all
+            // workers are back to sleep: this frame is provably complete
+            // before the score is computed below.
+            pool.executeFrameAndWait(dispatcher, [&](std::size_t worker_id) {
+                // Each worker owns its own PRNG, seeded off its id: no shared
+                // RNG state, no locks — and every sample sequence is
+                // statistically independent across workers.
+                XorShift32 rng(worker_id + 1);
+
+                while (const auto tileOpt = dispatcher.getNextTile()) {
+                    const Tile& tile = *tileOpt;
+                    // Render every pixel of this tile. Row-major order keeps
+                    // the Framebuffer stores cache-friendly.
+                    const int xEnd = tile.x + tile.width;
+                    const int yEnd = tile.y + tile.height;
+                    for (int y = tile.y; y < yEnd; ++y) {
+                        for (int x = tile.x; x < xEnd; ++x) {
+                            // kSamplesPerPixel jittered samples (MSAA + soft-shadow
+                            // + area-light integration), averaged — this is the
+                            // path-traced frame.
+                            Vec3 accumulated{};
+                            for (int s = 0; s < kSamplesPerPixel; ++s) {
+                                const double jx = x + rng.nextFloat();
+                                const double jy = y + rng.nextFloat();
+                                accumulated = accumulated +
+                                    scene.traceRay(generateCameraRay(jx, jy, kRenderWidth, kRenderHeight), rng);
                             }
+                            framebuffer.setPixel(x, y,
+                                                 toByte(accumulated.x / static_cast<double>(kSamplesPerPixel)),
+                                                 toByte(accumulated.y / static_cast<double>(kSamplesPerPixel)),
+                                                 toByte(accumulated.z / static_cast<double>(kSamplesPerPixel)));
                         }
-                        tilesDone.fetch_add(1, std::memory_order_relaxed);
                     }
-                });
+                    tilesDone.fetch_add(1, std::memory_order_relaxed);
+                }
+            });
 
-                // This frame is complete: count it, then loop for the next one.
-                completedFrames.fetch_add(1, std::memory_order_relaxed);
-            }
-
-            // The time window is over: stamp the end and compute the score.
-            // Time-precise: frames per second * 1000 — 880 frames in exactly
-            // 10.0 s → 88,000 pts, and a CPU that finishes the same work a
-            // fraction of a second faster is rewarded proportionally
-            // instead of being rounded down to whole integer frames.
+            // The frame is complete: stamp the end and compute the score.
+            // Time-precise: 1,600,000 / elapsed seconds — the numerator scales
+            // with the workload (4x the 400,000 baseline for the 1024-spp
+            // path-traced 4K frame vs 256 spp), so a CPU that finishes the
+            // same work a fraction of a second faster is rewarded
+            // proportionally instead of being rounded to whole frames.
             renderEnd = std::chrono::steady_clock::now();
             const double exactElapsedSeconds = std::chrono::duration<double>(renderEnd - renderStart).count();
-            finalScore = static_cast<int>(
-                (static_cast<double>(completedFrames.load(std::memory_order_relaxed)) / exactElapsedSeconds) * 1000.0);
-            renderFinished.store(true, std::memory_order_release); // publishes renderEnd, finalScore, completedFrames
+            finalScore = static_cast<int>(1600000.0 / exactElapsedSeconds);
+            renderFinished.store(true, std::memory_order_release); // publishes renderEnd, finalScore
         });
 
         state = State::Rendering;
@@ -351,29 +371,26 @@ int main() {
         }
 
         // Collect a finished run. The acquire-load pairs with the release-store
-        // in the render thread, so reading renderEnd, finalScore and
-        // completedFrames here is safe.
+        // in the render thread, so reading renderEnd and finalScore here is
+        // safe.
         if (state == State::Rendering && renderFinished.load(std::memory_order_acquire)) {
-            // renderFinished is only published after the 10-second loop has
-            // exited and every worker has been joined (see startBenchmark), so
-            // by the time we get here the last image is complete and
-            // renderThread has nothing left to do — the join is a fast no-op,
-            // not a wait.
+            // renderFinished is only published after executeFrameAndWait()
+            // returned — every tile rendered, all workers back to sleep (see
+            // startBenchmark) — so the join below is a fast no-op, not a wait.
             renderThread.join();
             lastRunMs = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
                             renderEnd - renderStart).count();
-            const int frames = completedFrames.load(std::memory_order_relaxed);
             hasResult = true;
             state = State::Idle;
 
-            std::printf("LinuxBench: benchmark complete — %.1f s, %d frames, score %d pts\n",
-                        lastRunMs / 1000.0, frames, finalScore);
+            std::printf("LinuxBench: benchmark complete — %.3f s, score %d pts\n",
+                        lastRunMs / 1000.0, finalScore);
             std::fflush(stdout);
 
             try {
                 framebuffer.savePPM("benchmark.ppm");
                 saveToCSV(finalScore, lastRunMs, getCPUName());
-                std::printf("Wrote benchmark.ppm (%dx%d, P6)\n", kImageWidth, kImageHeight);
+                std::printf("Wrote benchmark.ppm (%dx%d, P6)\n", kRenderWidth, kRenderHeight);
                 std::printf("Appended result to linuxbench_results.csv\n");
                 std::fflush(stdout); // do not hold the line in the buffer when the log is redirected
             } catch (const std::exception& e) {
@@ -392,11 +409,10 @@ int main() {
         // old deadlock is gone. Progress is also shown in the title bar.
         if (state != State::Idle) {
             const int cur = static_cast<int>(tilesDone.load(std::memory_order_relaxed));
-            const int frames = completedFrames.load(std::memory_order_relaxed);
             if (cur != lastTitleShown) {
                 char title[128];
-                std::snprintf(title, sizeof(title), "LinuxBench \u2014 Rendering\u2026 frame %d \u00B7 %d / %d tiles",
-                              frames, cur, static_cast<int>(totalTiles));
+                std::snprintf(title, sizeof(title), "LinuxBench \u2014 Rendering\u2026 %d / %d tiles",
+                              cur, static_cast<int>(totalTiles));
                 glfwSetWindowTitle(window, title);
                 lastTitleShown = cur;
             }
@@ -419,39 +435,30 @@ int main() {
         ImGui::Begin("LinuxBench", nullptr, windowFlags);
 
         if (state == State::Rendering) {
-            // Live status: time left, frames finished so far, progress bars.
+            // Live status: elapsed time and tile progress for the single
+            // path-traced frame.
             const auto now = std::chrono::steady_clock::now();
             const double elapsed = std::chrono::duration<double>(now - renderStart).count();
-            const double timeLeft = std::max(0.0, kBenchmarkDurationSeconds - elapsed);
-            const int frames = completedFrames.load(std::memory_order_relaxed);
             const std::size_t tiles = tilesDone.load(std::memory_order_relaxed);
 
-            ImGui::TextColored(ImVec4(0.55f, 0.85f, 1.0f, 1.0f), "Benchmark running\u2026");
-            ImGui::Text("Time left: %.1f s", timeLeft);
-            ImGui::Text("Frames completed: %d", frames);
-            ImGui::ProgressBar(static_cast<float>(std::min(1.0, elapsed / kBenchmarkDurationSeconds)),
-                               ImVec2(280, 0));
-            ImGui::Text("Current frame: %zu / %zu tiles", tiles, totalTiles);
+            ImGui::TextColored(ImVec4(0.55f, 0.85f, 1.0f, 1.0f), "Path tracing\u2026 %d samples/pixel", kSamplesPerPixel);
+            ImGui::Text("Elapsed: %.1f s", elapsed);
+            ImGui::Text("%zu / %zu tiles", tiles, totalTiles);
             ImGui::ProgressBar(static_cast<float>(static_cast<double>(tiles) / static_cast<double>(totalTiles)),
-                               ImVec2(280, 0));
+                               ImVec2(280 * scale, 0));
             ImGui::Separator();
         } else {
             // Idle: the run button, and — once a run has completed — the score.
-            if (ImGui::Button("Run Benchmark", ImVec2(220, 48))) {
+            if (ImGui::Button("Run Benchmark", ImVec2(220 * scale, 48 * scale))) {
                 startBenchmark();
             }
             if (hasResult) {
-                const int frames = completedFrames.load(std::memory_order_relaxed);
                 ImGui::Separator();
                 ImGui::PushFont(scoreFont);
                 ImGui::TextColored(ImVec4(0.45f, 1.0f, 0.55f, 1.0f), "%d pts", finalScore);
                 ImGui::PopFont();
                 ImGui::Text("Total time: %.3f ms", lastRunMs);
-                if (frames > 0 && lastRunMs > 0.0) {
-                    const double avgMs = lastRunMs / static_cast<double>(frames);
-                    ImGui::Text("%d frames \u00B7 %.3f ms/frame \u00B7 %.1f fps",
-                                frames, avgMs, 1000.0 / avgMs);
-                }
+                ImGui::Text("%dx%d \u00B7 %d samples/pixel", kRenderWidth, kRenderHeight, kSamplesPerPixel);
 
                 // Leaderboard: reference profiles + the user's run, ranked by score.
                 struct LeaderboardEntry {
@@ -472,13 +479,13 @@ int main() {
 
                 ImGui::Separator();
                 ImGui::Text("Leaderboard");
-                ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(10.0f, 6.0f));
+                ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(10.0f * scale, 6.0f * scale));
                 if (ImGui::BeginTable("leaderboard", 3,
                                       ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
                                       ImGuiTableFlags_SizingStretchProp)) {
-                    ImGui::TableSetupColumn("Rank", ImGuiTableColumnFlags_WidthFixed, 52.0f);
+                    ImGui::TableSetupColumn("Rank", ImGuiTableColumnFlags_WidthFixed, 52.0f * scale);
                     ImGui::TableSetupColumn("CPU", ImGuiTableColumnFlags_WidthStretch);
-                    ImGui::TableSetupColumn("Score", ImGuiTableColumnFlags_WidthFixed, 110.0f);
+                    ImGui::TableSetupColumn("Score", ImGuiTableColumnFlags_WidthFixed, 110.0f * scale);
                     ImGui::TableHeadersRow();
 
                     int rank = 1;
@@ -511,8 +518,13 @@ int main() {
         }
 
         // The texture was just uploaded above; ImGui only references its ID.
-        ImGui::Image(reinterpret_cast<ImTextureID>(framebuffer.getTextureID()),
-                     ImVec2(static_cast<float>(kImageWidth), static_cast<float>(kImageHeight)));
+        // Scale the 4K render down to fill the remaining content region,
+        // preserving the aspect ratio, so it fits the window without scrolling.
+        ImVec2 avail = ImGui::GetContentRegionAvail();
+        float aspect = static_cast<float>(kRenderWidth) / static_cast<float>(kRenderHeight);
+        float imgWidth = avail.x;
+        float imgHeight = imgWidth / aspect;
+        ImGui::Image(reinterpret_cast<ImTextureID>(framebuffer.getTextureID()), ImVec2(imgWidth, imgHeight));
 
         ImGui::End();
         ImGui::EndFrame();

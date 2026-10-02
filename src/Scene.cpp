@@ -15,34 +15,47 @@ namespace {
 // ---------------------------------------------------------------------------
 // Procedural scene parameters.
 //
-// A kGridSize^3 grid of slightly overlapping spheres, each tessellated into
-// a lat/long triangle mesh. All spheres are merged into a single
-// triangle-mesh geometry so Embree builds one BVH over ~10M triangles — the
-// real, heavy workload behind traceRay().
+// A kGridSize^3 grid of non-intersecting spheres (2r = 0.17 < kSpacing = 0.32,
+// and even with ±kPosJitter the closest pair of centers stays ~0.256 apart,
+// more than the sum of two radii) plus a large planar floor disk at y = 0.
+// Both are tessellated into triangle meshes and uploaded as separate Embree
+// geometries — the floor first (geomID 0), the sphere field second (geomID 1)
+// — so Embree builds one BVH over ~10.5M triangles: the heavy workload behind
+// traceRay().
 // ---------------------------------------------------------------------------
-constexpr int   kGridSize    = 28;  // spheres per axis (28^3 = 21 952 spheres)
-constexpr float kSpacing     = 0.30f; // center-to-center distance; 2r > spacing, so neighbors intersect
-constexpr float kBaseRadius  = 0.17f; // base sphere radius (with ±~20% jitter)
-constexpr int   kLonSegments = 20;  // longitude segments per sphere
-constexpr int   kLatSegments = 14;  // latitude bands per sphere
-constexpr Vec3  kFieldCenter{0.0, 0.0, -6.0}; // in front of the camera at the origin
+constexpr int   kGridSize    = 28;    // spheres per axis (28^3 = 21 952 spheres)
+constexpr float kSpacing     = 0.32f; // center-to-center distance
+constexpr float kBaseRadius  = 0.085f; // sphere radius (2r < spacing: no intersection)
+constexpr float kPosJitter   = 0.032f; // ± position jitter (still non-intersecting)
+constexpr int   kLonSegments = 20;    // longitude segments per sphere
+constexpr int   kLatSegments = 14;    // latitude bands per sphere
+constexpr Vec3  kFieldCenter{0.0, 6.0, -11.0}; // in front of the camera
 
-// Lambertian light direction. Normalized once; initialization of a static
-// local is thread-safe in C++11 and later.
-const Vec3 kLightDir = Vec3(0.40, 0.70, 0.50).normalize();
+// Floor: a planar disk at y = 0.
+constexpr double kFloorRadius   = 200.0;
+constexpr int    kFloorSegments = 128;
 
-// Vertical background gradient: warm at the bottom, cool at the top.
-// Kept visually identical to the old analytic backend so misses read the
-// same way.
-[[nodiscard]] Vec3 backgroundColor(const Vec3& dir) {
-    const double t = dir.y * 0.5 + 0.5; // 0 = looking down, 1 = looking up
-    const Vec3 down(1.0, 0.85, 0.70);
-    const Vec3 up(0.15, 0.35, 0.65);
-    return down * (1.0 - t) + up * t;
+// ---------------------------------------------------------------------------
+// Dusk sky — the only light source in the scene.
+// ---------------------------------------------------------------------------
+const Vec3 kSunDir = Vec3(0.45, 0.14, -0.88).normalize(); // low, in front of the field
+
+[[nodiscard]] Vec3 skyColor(const Vec3& dir) {
+    const double t = std::clamp(dir.y, 0.0, 1.0); // 0 = horizon, 1 = zenith
+    const Vec3 horizon(1.00, 0.60, 0.38);
+    const Vec3 zenith(0.05, 0.13, 0.33);
+    Vec3 sky = horizon * (1.0 - t) + zenith * t;
+
+    // Sun: a tight core plus a broad glow.
+    const double cosSun = std::max(0.0, dir.dot(kSunDir));
+    const double sun = std::pow(cosSun, 900.0) * 3.0 + std::pow(cosSun, 8.0) * 0.35;
+    return sky + Vec3(1.0, 0.55, 0.25) * sun;
 }
 
+// ---------------------------------------------------------------------------
 // Deterministic 32-bit mixer (splitmix-style): stable per-sphere colors and
-// jitter without any per-frame randomness or shared RNG state.
+// material assignment without any per-frame randomness or shared RNG state.
+// ---------------------------------------------------------------------------
 [[nodiscard]] uint32_t hash32(uint32_t x) {
     x ^= x >> 16;
     x *= 0x7feb352d;
@@ -57,7 +70,7 @@ const Vec3 kLightDir = Vec3(0.40, 0.70, 0.50).normalize();
 }
 
 // Maps a hue in [0,1) to a soft, saturated color (HSL with s = l = 0.5,
-// lifted slightly toward white so Lambertian shading has headroom).
+// lifted slightly toward white so shading has headroom).
 [[nodiscard]] Vec3 hueToColor(double hue) {
     const double hp = hue * 6.0;
     const double c = 1.0;
@@ -75,6 +88,113 @@ const Vec3 kLightDir = Vec3(0.40, 0.70, 0.50).normalize();
     return Vec3(r * (1.0 - lift) + lift,
                 g * (1.0 - lift) + lift,
                 b * (1.0 - lift) + lift);
+}
+
+// ---------------------------------------------------------------------------
+// Materials.
+// ---------------------------------------------------------------------------
+enum class MaterialType { Matte, Metal, Glass };
+
+struct Material {
+    MaterialType type = MaterialType::Matte;
+    Vec3  albedo{1.0, 1.0, 1.0};
+    float roughness = 0.0f; // Metal only: random fuzz added to the reflection
+};
+
+// The floor: a dark, nearly mirror-smooth metal.
+constexpr Material kFloorMaterial{MaterialType::Metal, Vec3(0.12, 0.12, 0.13), 0.08f};
+
+// Sphere metals: a bit rougher than the floor for visual variety.
+constexpr float kSphereMetalRoughness = 0.2f;
+
+// 10% glass, 40% metal, 50% matte — decided by the sphere id hash.
+[[nodiscard]] Material sphereMaterial(uint32_t sphereId, const Vec3& baseColor) {
+    const double roll = hash01(sphereId);
+    if (roll < 0.10) {
+        return {MaterialType::Glass, baseColor, 0.0f};
+    }
+    if (roll < 0.50) {
+        return {MaterialType::Metal, baseColor, kSphereMetalRoughness};
+    }
+    return {MaterialType::Matte, baseColor, 0.0f};
+}
+
+// ---------------------------------------------------------------------------
+// Sampling & shading math (unit vectors, double precision).
+// ---------------------------------------------------------------------------
+
+// Uniform random direction on the unit sphere.
+[[nodiscard]] Vec3 randomUnitVector(XorShift32& rng) {
+    const double c = 2.0 * rng.nextFloat() - 1.0;
+    const double a = 2.0 * M_PI * rng.nextFloat();
+    const double s = std::sqrt(std::max(0.0, 1.0 - c * c));
+    return {s * std::cos(a), c, s * std::sin(a)};
+}
+
+// Cosine-weighted direction in the hemisphere about n. The sampling weight
+// cancels the cosine of the BRDF, so the complete BSDF term is just albedo.
+[[nodiscard]] Vec3 cosineHemisphere(const Vec3& n, XorShift32& rng) {
+    const double u = 2.0 * M_PI * rng.nextFloat();
+    const double r = std::sqrt(rng.nextFloat());
+    const Vec3 local = {r * std::cos(u), r * std::sin(u), std::sqrt(std::max(0.0, 1.0 - r * r))};
+
+    const Vec3 any = (std::fabs(n.y) < 0.999) ? Vec3(0.0, 1.0, 0.0) : Vec3(1.0, 0.0, 0.0);
+    const Vec3 t1 = any.cross(n).normalize();
+    const Vec3 t2 = n.cross(t1);
+    return local.x * t1 + local.y * t2 + local.z * n;
+}
+
+// Specular reflection of unit d about unit n.
+[[nodiscard]] Vec3 reflectVec(const Vec3& d, const Vec3& n) {
+    return d - 2.0 * d.dot(n) * n;
+}
+
+// Standard refraction: i is a unit direction, n is a unit normal oriented
+// against i, eta is the relative index of refraction (n1/n2). Returns a
+// zero vector on total internal reflection.
+[[nodiscard]] Vec3 refractVec(const Vec3& i, const Vec3& n, double eta) {
+    const double c  = std::min(1.0, -i.dot(n));
+    const double s2 = eta * eta * (1.0 - c * c);
+    if (s2 >= 1.0) {
+        return {};
+    }
+    return eta * i + (eta * c - std::sqrt(1.0 - s2)) * n;
+}
+
+// Fresnel–Schlick (Duff, "Notes on Rendering").
+[[nodiscard]] double schlickFresnel(double cosI, double cosT, double eta) {
+    const double r0 = (1.0 - eta) / (1.0 + eta);
+    const double r1 = eta * eta * (cosI * cosI - cosT * cosT) / (cosI * cosI + cosT * cosT);
+    return r0 + r1 * std::pow(1.0 - cosI, 5.0);
+}
+
+// ---------------------------------------------------------------------------
+// Mesh construction.
+// ---------------------------------------------------------------------------
+
+// Appends a planar disk at y = 0 as a triangle fan: one center vertex plus
+// `segments` ring vertices → `segments` triangles. Embree hits both sides of
+// a triangle, so winding is irrelevant — the normal is oriented against the
+// ray in traceRay().
+void appendFloorDisk(double radius,
+                     int segments,
+                     std::vector<float>& positions,
+                     std::vector<uint32_t>& indices) {
+    const uint32_t center = static_cast<uint32_t>(positions.size() / 3);
+    positions.push_back(0.0f);
+    positions.push_back(0.0f);
+    positions.push_back(0.0f);
+    for (int i = 0; i < segments; ++i) {
+        const double a = 2.0 * M_PI * static_cast<double>(i) / static_cast<double>(segments);
+        positions.push_back(static_cast<float>(radius * std::cos(a)));
+        positions.push_back(0.0f);
+        positions.push_back(static_cast<float>(radius * std::sin(a)));
+    }
+    for (int i = 0; i < segments; ++i) {
+        indices.push_back(center);
+        indices.push_back(center + 1u + static_cast<uint32_t>(i));
+        indices.push_back(center + 1u + static_cast<uint32_t>((i + 1) % segments));
+    }
 }
 
 // Appends one sphere — two polar fans plus (kLatSegments - 3) bands of
@@ -191,7 +311,56 @@ Scene::Scene() {
         throw std::runtime_error("Embree: rtcNewScene() failed");
     }
 
-    // ---- Procedural geometry: a dense field of intersecting spheres ----
+    // Uploads a triangle-mesh buffer pair to Embree and attaches it to the
+    // scene. Attachment order is the geometry id: the floor is attached
+    // first (geomID 0), the sphere field second (geomID 1).
+    auto attachMesh = [this, &fail](const std::vector<float>& positions,
+                                    const std::vector<uint32_t>& indices) {
+        const std::size_t vertexCount   = positions.size() / 3;
+        const std::size_t triangleCount = indices.size() / 3;
+
+        RTCGeometry geometry = rtcNewGeometry(m_device, RTC_GEOMETRY_TYPE_TRIANGLE);
+        if (geometry == nullptr) {
+            throw fail("rtcNewGeometry() failed");
+        }
+
+        // v4 API: rtcSetNewGeometryBuffer() *allocates* the buffer and
+        // returns a pointer to fill; Embree consumes the data at commit.
+        float* vertices = static_cast<float*>(
+            rtcSetNewGeometryBuffer(geometry, RTC_BUFFER_TYPE_VERTEX, 0,
+                                    RTC_FORMAT_FLOAT3, 3 * sizeof(float), vertexCount));
+        if (vertices == nullptr) {
+            rtcReleaseGeometry(geometry);
+            throw fail("rtcSetNewGeometryBuffer(VERTEX) failed");
+        }
+        std::memcpy(vertices, positions.data(), positions.size() * sizeof(float));
+
+        unsigned* triangleIndices = static_cast<unsigned*>(
+            rtcSetNewGeometryBuffer(geometry, RTC_BUFFER_TYPE_INDEX, 0,
+                                    RTC_FORMAT_UINT3, 3 * sizeof(unsigned), triangleCount));
+        if (triangleIndices == nullptr) {
+            rtcReleaseGeometry(geometry);
+            throw fail("rtcSetNewGeometryBuffer(INDEX) failed");
+        }
+        std::memcpy(triangleIndices, indices.data(), indices.size() * sizeof(uint32_t));
+
+        rtcCommitGeometry(geometry);
+
+        // Attach transfers scene ownership of the geometry; drop our handle.
+        rtcAttachGeometry(m_scene, geometry);
+        rtcReleaseGeometry(geometry);
+    };
+
+    // ---- geomID 0: the floor disk (planar fan at y = 0) ----
+    {
+        std::vector<float>    floorPositions;
+        std::vector<uint32_t> floorIndices;
+        appendFloorDisk(kFloorRadius, kFloorSegments, floorPositions, floorIndices);
+        attachMesh(floorPositions, floorIndices);
+        m_triangleCount += floorIndices.size() / 3;
+    }
+
+    // ---- geomID 1: the sphere field ----
     const int n = kGridSize;
     m_sphereCount = static_cast<std::size_t>(n) * n * n;
 
@@ -208,49 +377,18 @@ Scene::Scene() {
                 const double u = hash01(sphereId * 3 + 0);
                 const double v = hash01(sphereId * 3 + 1);
                 const double w = hash01(sphereId * 3 + 2);
-                // Slight position jitter so the field is not a perfect lattice.
+                // Slight position jitter so the field is not a perfect lattice
+                // — the worst case stays non-intersecting (see header math).
                 const Vec3 center = kFieldCenter
                     + Vec3(ix - halfGrid, iy - halfGrid, iz - halfGrid) * kSpacing
-                    + Vec3(u * 2.0 - 1.0, v * 2.0 - 1.0, w * 2.0 - 1.0) * (kSpacing * 0.18);
-                const double radius = kBaseRadius * (0.85 + 0.45 * hash01(sphereId * 7 + 5));
-                appendSphere(center, radius, positions, indices);
+                    + Vec3(u * 2.0 - 1.0, v * 2.0 - 1.0, w * 2.0 - 1.0) * kPosJitter;
+                appendSphere(center, kBaseRadius, positions, indices);
             }
         }
     }
 
-    m_triangleCount = indices.size() / 3;
-    const std::size_t vertexCount   = positions.size() / 3;
-    const std::size_t triangleCount = indices.size() / 3;
-
-    // ---- Upload to Embree ----
-    // v4 API: rtcSetNewGeometryBuffer() *allocates* the buffer and returns
-    // a pointer to fill; Embree consumes the data at commit time.
-    RTCGeometry geometry = rtcNewGeometry(m_device, RTC_GEOMETRY_TYPE_TRIANGLE);
-    if (geometry == nullptr) {
-        throw fail("rtcNewGeometry() failed");
-    }
-
-    float* vertices = static_cast<float*>(
-        rtcSetNewGeometryBuffer(geometry, RTC_BUFFER_TYPE_VERTEX, 0,
-                                RTC_FORMAT_FLOAT3, 3 * sizeof(float), vertexCount));
-    if (vertices == nullptr) {
-        throw fail("rtcSetNewGeometryBuffer(VERTEX) failed");
-    }
-    std::memcpy(vertices, positions.data(), positions.size() * sizeof(float));
-
-    unsigned* triangleIndices = static_cast<unsigned*>(
-        rtcSetNewGeometryBuffer(geometry, RTC_BUFFER_TYPE_INDEX, 0,
-                                RTC_FORMAT_UINT3, 3 * sizeof(unsigned), triangleCount));
-    if (triangleIndices == nullptr) {
-        throw fail("rtcSetNewGeometryBuffer(INDEX) failed");
-    }
-    std::memcpy(triangleIndices, indices.data(), indices.size() * sizeof(uint32_t));
-
-    rtcCommitGeometry(geometry);
-
-    // Attach transfers scene ownership of the geometry; drop our handle.
-    rtcAttachGeometry(m_scene, geometry);
-    rtcReleaseGeometry(geometry);
+    attachMesh(positions, indices);
+    m_triangleCount += indices.size() / 3;
 
     // Builds the BVH over the committed geometry (default MEDIUM quality).
     rtcCommitScene(m_scene);
@@ -274,109 +412,143 @@ Scene::~Scene() {
 }
 
 // ---------------------------------------------------------------------------
-// traceRay: nearest-hit query via rtcIntersect1, a hard-shadow occlusion
-// test via rtcOccluded1, then Lambertian shading.
+// traceRay: a path tracer with at most 4 bounces.
 //
-// Every shaded pixel therefore costs two BVH traversals (primary ray +
-// shadow ray) — that doubled traversal workload is the point of this
-// benchmark.
+// Every bounce resolves the nearest hit via rtcIntersect1, then samples the
+// local BRDF:
+//   * Matte — cosine-weighted hemisphere (Lambert sampling);
+//   * Metal — specular reflection plus a random fuzz scaled by roughness;
+//   * Glass — Schlick fresnel decides reflection vs refraction (IOR 1.5,
+//     total internal reflection when the sine of the refraction angle
+//     overflows).
+// The light is entirely the analytic dusk sky (gradient + sun), so the loop
+// accumulates throughput * sky on the first miss. Paths whose throughput
+// drops below 0.001 in any relevant sense are cut early.
 //
-// Thread-safety: the scene is committed (read-only) and every ray/hit
-// struct below lives in caller-local stack storage, so any number of
-// worker threads may call this concurrently — exactly the usage pattern
-// Embree documents for its ray queries.
+// Thread-safety: the scene is committed (read-only) and every ray/hit struct
+// lives in caller-local stack storage, so any number of worker threads may
+// call this concurrently — exactly the usage pattern Embree documents.
 // ---------------------------------------------------------------------------
-Vec3 Scene::traceRay(const Ray& ray) const {
-    RTCRayHit rayhit{};
-    rayhit.ray.org_x  = static_cast<float>(ray.origin.x);
-    rayhit.ray.org_y  = static_cast<float>(ray.origin.y);
-    rayhit.ray.org_z  = static_cast<float>(ray.origin.z);
-    rayhit.ray.tnear  = 0.0f; // forward-only: ignore geometry behind the camera
-    rayhit.ray.dir_x  = static_cast<float>(ray.direction.x);
-    rayhit.ray.dir_y  = static_cast<float>(ray.direction.y);
-    rayhit.ray.dir_z  = static_cast<float>(ray.direction.z);
-    rayhit.ray.time   = 0.0f;
-    rayhit.ray.tfar   = std::numeric_limits<float>::infinity();
-    rayhit.ray.mask   = 0xFFFFFFFFu; // all geometry
-    rayhit.ray.id     = 0;
-    rayhit.ray.flags  = 0;
-    rayhit.hit.geomID = RTC_INVALID_GEOMETRY_ID; // miss sentinel, as in Embree's own tests
-    rayhit.hit.primID = RTC_INVALID_GEOMETRY_ID;
-    rayhit.hit.instID[0]     = RTC_INVALID_GEOMETRY_ID;
-    rayhit.hit.instPrimID[0] = RTC_INVALID_GEOMETRY_ID;
+Vec3 Scene::traceRay(const Ray& ray, XorShift32& rng) const {
+    constexpr int    kMaxBounces    = 4;
+    constexpr double kRayBias       = 1e-4;  // self-intersection guard
+    constexpr double kMinThroughput = 0.001; // early-exit threshold
+    constexpr double kGlassIOR      = 1.5;
 
-    rtcIntersect1(m_scene, &rayhit);
+    Vec3 throughput{1.0, 1.0, 1.0}; // running product of BSDF terms
+    Vec3 radiance{};                // accumulated radiance
+    Ray  curRay = ray;              // local, mutable copy (the parameter is const)
 
-    if (rayhit.hit.geomID == RTC_INVALID_GEOMETRY_ID) {
-        return backgroundColor(ray.direction);
+    for (int bounce = 0; bounce < kMaxBounces; ++bounce) {
+        RTCRayHit rayhit{};
+        rayhit.ray.org_x  = static_cast<float>(curRay.origin.x);
+        rayhit.ray.org_y  = static_cast<float>(curRay.origin.y);
+        rayhit.ray.org_z  = static_cast<float>(curRay.origin.z);
+        rayhit.ray.tnear  = static_cast<float>(kRayBias); // skip the surface we just left
+        rayhit.ray.dir_x  = static_cast<float>(curRay.direction.x);
+        rayhit.ray.dir_y  = static_cast<float>(curRay.direction.y);
+        rayhit.ray.dir_z  = static_cast<float>(curRay.direction.z);
+        rayhit.ray.time   = 0.0f;
+        rayhit.ray.tfar   = std::numeric_limits<float>::infinity();
+        rayhit.ray.mask   = 0xFFFFFFFFu; // all geometry
+        rayhit.ray.id     = 0;
+        rayhit.ray.flags  = 0;
+        rayhit.hit.geomID = RTC_INVALID_GEOMETRY_ID; // miss sentinel
+        rayhit.hit.primID = RTC_INVALID_GEOMETRY_ID;
+        rayhit.hit.instID[0]     = RTC_INVALID_GEOMETRY_ID;
+        rayhit.hit.instPrimID[0] = RTC_INVALID_GEOMETRY_ID;
+
+        rtcIntersect1(m_scene, &rayhit);
+
+        if (rayhit.hit.geomID == RTC_INVALID_GEOMETRY_ID) {
+            // Miss: collect the sky along this direction.
+            radiance = radiance + throughput * skyColor(curRay.direction);
+            break;
+        }
+
+        // ---- Geometric (flat) normal, oriented against the ray ----
+        Vec3 n(static_cast<double>(rayhit.hit.Ng_x),
+               static_cast<double>(rayhit.hit.Ng_y),
+               static_cast<double>(rayhit.hit.Ng_z));
+        // Before the flip: a ray hitting the outside of glass comes in from
+        // the air (eta = 1/IOR); from inside it exits (eta = IOR).
+        const bool entering = n.dot(curRay.direction) < 0.0;
+        if (n.dot(curRay.direction) > 0.0) {
+            n = n * -1.0; // face the incoming ray
+        }
+
+        // ---- Hit point (this Embree build reports the distance in ray.tfar) ----
+        const Vec3 p = curRay.origin + curRay.direction * rayhit.ray.tfar;
+
+        // ---- Material: geomID 0 is the floor, geomID 1 the sphere field ----
+        Material mat;
+        if (rayhit.hit.geomID == 0) {
+            mat = kFloorMaterial;
+        } else {
+            // Triangles were generated in sphere-major order with a fixed
+            // count per sphere, so the sphere id is a simple division.
+            const uint32_t sphereId =
+                static_cast<uint32_t>(rayhit.hit.primID / kTrianglesPerSphere);
+            const double hue = std::fmod(hash01(sphereId) * 0.6180339887, 1.0);
+            mat = sphereMaterial(sphereId, hueToColor(hue));
+        }
+
+        // ---- Sample the local BRDF ----
+        Vec3 nextDir{};
+        Vec3 bsdf{1.0, 1.0, 1.0};
+        switch (mat.type) {
+            case MaterialType::Matte:
+                nextDir = cosineHemisphere(n, rng);
+                bsdf    = mat.albedo;
+                break;
+
+            case MaterialType::Metal: {
+                Vec3 r = reflectVec(curRay.direction, n);
+                if (mat.roughness > 0.0f) {
+                    // Reflection + random fuzz; keep the result in front of
+                    // the surface when the fuzz flips it behind.
+                    r = (r + randomUnitVector(rng) * mat.roughness).normalize();
+                    if (r.dot(n) <= 0.0) {
+                        r = reflectVec(curRay.direction, n);
+                    }
+                }
+                nextDir = r;
+                bsdf    = mat.albedo;
+                break;
+            }
+
+            case MaterialType::Glass: {
+                const double eta   = entering ? (1.0 / kGlassIOR) : kGlassIOR;
+                const double cosI  = std::min(1.0, -n.dot(curRay.direction));
+                const double sin2T = eta * eta * (1.0 - cosI * cosI);
+                if (sin2T >= 1.0) {
+                    nextDir = reflectVec(curRay.direction, n); // total internal reflection
+                } else {
+                    const double cosT = std::sqrt(1.0 - sin2T);
+                    const double F    = schlickFresnel(cosI, cosT, eta);
+                    if (rng.nextFloat() < F) {
+                        nextDir = reflectVec(curRay.direction, n);
+                    } else {
+                        nextDir = refractVec(curRay.direction, n, eta);
+                    }
+                }
+                bsdf = mat.albedo;
+                break;
+            }
+        }
+
+        // ---- Update the throughput and bail out if the path is dead ----
+        throughput = throughput * bsdf;
+        if (std::max(throughput.x, std::max(throughput.y, throughput.z)) < kMinThroughput) {
+            break;
+        }
+        if (bounce + 1 == kMaxBounces) {
+            break; // bounded depth
+        }
+
+        // Continue from just in front of the hit point, along the normal.
+        curRay = Ray{p + n * kRayBias, nextDir.normalize()};
     }
 
-    // ---- Geometric (flat) normal of the hit triangle ----
-    // The intersection kernel provides it directly; orient it against the
-    // ray so double-sided hits shade correctly.
-    Vec3 normal(static_cast<double>(rayhit.hit.Ng_x),
-                static_cast<double>(rayhit.hit.Ng_y),
-                static_cast<double>(rayhit.hit.Ng_z));
-    if (normal.dot(ray.direction) > 0.0) {
-        normal = normal * -1.0; // face the incoming ray
-    }
-
-    // ---- Per-sphere base color ----
-    // Triangles were generated in sphere-major order with a fixed count per
-    // sphere, so the sphere id is a simple division.
-    const std::size_t tri      = rayhit.hit.primID;
-    const std::size_t sphereId = tri / kTrianglesPerSphere;
-    const double hue = std::fmod(hash01(static_cast<uint32_t>(sphereId)) * 0.6180339887, 1.0);
-    const Vec3 base = hueToColor(hue);
-
-    // ---- Hard shadow: occlusion test toward the light ----
-    // Fire a shadow ray from the hit point straight at kLightDir and let
-    // Embree decide whether anything blocks it (rtcOccluded1: an any-hit
-    // query — no hit data is needed, just "did something get in the
-    // way?"). This is a second full BVH traversal per pixel.
-    //
-    // Self-intersection guard (shadow acne): the origin is nudged along
-    // the hit normal so the shadow ray does not hit the very triangle the
-    // primary ray just struck, and tnear is set to the same bias.
-    constexpr float kShadowBias = 0.001f;
-
-    // Hit point. This Embree version reports the hit distance in ray.tfar
-    // (RTCHit carries no t member here).
-    const float hx = rayhit.ray.org_x + rayhit.ray.tfar * rayhit.ray.dir_x;
-    const float hy = rayhit.ray.org_y + rayhit.ray.tfar * rayhit.ray.dir_y;
-    const float hz = rayhit.ray.org_z + rayhit.ray.tfar * rayhit.ray.dir_z;
-
-    RTCRay shadow_ray{};
-    shadow_ray.org_x  = hx + static_cast<float>(normal.x) * kShadowBias;
-    shadow_ray.org_y  = hy + static_cast<float>(normal.y) * kShadowBias;
-    shadow_ray.org_z  = hz + static_cast<float>(normal.z) * kShadowBias;
-    shadow_ray.tnear  = kShadowBias;
-    shadow_ray.dir_x  = static_cast<float>(kLightDir.x);
-    shadow_ray.dir_y  = static_cast<float>(kLightDir.y);
-    shadow_ray.dir_z  = static_cast<float>(kLightDir.z);
-    shadow_ray.time   = 0.0f;
-    shadow_ray.tfar   = std::numeric_limits<float>::infinity();
-    shadow_ray.mask   = 0xFFFFFFFFu; // every primitive may occlude
-    shadow_ray.id     = 0;
-    shadow_ray.flags  = 0;
-
-    RTCOccludedArguments shadow_args{};
-    rtcInitOccludedArguments(&shadow_args); // incoherent traversal, no callbacks
-    rtcOccluded1(m_scene, &shadow_ray, &shadow_args);
-
-    // Embree signals occlusion by driving tfar negative (neg_inf); an
-    // unoccluded ray keeps its +inf tfar.
-    const bool inShadow = shadow_ray.tfar < 0.0f;
-
-    // ---- Simple Lambertian shading: ambient + diffuse ----
-    // Deliberately brighter than a physical Lambert term: a strong diffuse
-    // multiplier pushes the lit side past 1.0 for a vivid look, while a
-    // shadowed point receives only the ambient floor.
-    const double ndl   = normal.dot(kLightDir);
-    const double shade = inShadow ? 0.25 : 0.5 + 1.5 * (ndl > 0.0 ? ndl : 0.0);
-
-    // Clamp each channel to [0,1] before the 8-bit PPM conversion.
-    return Vec3(std::clamp(base.x * shade, 0.0, 1.0),
-                std::clamp(base.y * shade, 0.0, 1.0),
-                std::clamp(base.z * shade, 0.0, 1.0));
+    return radiance;
 }

@@ -1,5 +1,6 @@
 # LinuxBench
 
+[![Version](https://img.shields.io/badge/Version-0.2.0-brightgreen?style=for-the-badge)](CMakeLists.txt)
 [![C++20](https://img.shields.io/badge/C%2B%2B-20-blue?style=for-the-badge)](https://isocpp.org)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20x86_64-green?style=for-the-badge)](https://www.linux.org)
 [![Embree](https://img.shields.io/badge/Embree-4.4.1-6ea1c3?style=for-the-badge)](https://embree.github.io)
@@ -8,30 +9,47 @@
 [![License](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)](LICENSE)
 
 > **A native, Cinebench-style CPU stress-test and benchmark for Linux.**
-> Real raytracing. Real hardware. One clean score.
+> True path tracing. Real hardware. One clean score.
 
 ## Overview
 
 LinuxBench is a single-purpose CPU benchmark that turns your machine into a
-raytracer and measures how fast it is. It renders a 1920×1080 frame from a
-procedural scene of roughly **10 million triangles** — built on
+**true path tracer** and measures how fast it is. It renders a **single 4K
+frame (3840×2160) at 1024 samples per pixel** from a procedural scene of
+roughly **10.5 million triangles** — built on
 [Intel Embree 4](https://embree.github.io) for production-grade SIMD BVH
-construction and ray intersection — and runs that exact workload in a
-precise **10-second window**. The score is your throughput: how many full
-frames per second the CPU can push, scaled to thousands of points.
+construction and ray intersection — and scores the run by its exact
+wall-clock time.
+
+v0.2.0 is a fundamental architectural shift: where v0.1.x ran a 1080p
+real-time frame-rate loop, LinuxBench now performs an offline-style render —
+one massive, physically-based path-traced 4K frame — a workload heavy enough
+to pin a Ryzen 9 9950X3D for a full minute.
 
 The whole application is a single native binary: GLFW provides the window
 and OpenGL context, Dear ImGui draws a full-window live UI (progress, score,
-leaderboard), and a persistent worker pool renders tiles of the frame while
-you watch the image assemble in real time. No Python wrappers, no Electron,
-no telemetry — just C++20 and your silicon.
+leaderboard), and a persistent worker pool path-traces tiles of the frame
+while you watch the image assemble in real time. No Python wrappers, no
+Electron, no telemetry — just C++20 and your silicon.
 
 ## Features
 
-- **Heavy, realistic workload** — a procedural scene of 28³ (21,952)
-  tessellated spheres merged into one triangle-mesh geometry (~10M
-  triangles), one BVH built by Embree, and **hard shadows** via a full
-  second BVH traversal per pixel.
+- **True path tracing** — every pixel is integrated with **1024 jittered
+  samples per pixel**, each one a full light path through the scene with
+  **global illumination up to 4 bounces** deep, lit only by the analytic
+  dusk sky (gradient + sun).
+- **PBR materials** — the 21,952-sphere field is a deliberate mix:
+  **10% glass (IOR 1.5)**, **40% rough metal**, and **50% matte**, decided
+  per sphere by an id hash, so every material branch is exercised.
+- **Cosine-weighted hemisphere sampling** — the matte (Lambert) BRDF is
+  sampled directly from its cosine-weighted distribution: unbiased diffuse
+  integration with no importance-sampling waste.
+- **Schlick's Fresnel approximation** — glass and metal use Schlick's F(θ)
+  to split energy between reflection and refraction, with total internal
+  reflection when the refraction angle overflows.
+- **17+ billion ray traversals per run** — 8.5 billion primary rays
+  (3840×2160 × 1024 spp) plus secondary GI bounces, each one a full Embree
+  BVH traversal against ~10.5M triangles.
 - **Intel Embree 4.4.1** — hardware-SIMD BVH and intersection kernels
   (ISPC-free, no TBB) for a workload that actually saturates modern CPUs.
 - **Persistent thread pool** — worker threads are created once and reused
@@ -39,10 +57,10 @@ no telemetry — just C++20 and your silicon.
 - **Lock-free live preview** — the framebuffer double-buffers its pixels
   under a short lock, so the UI uploads and renders every frame *while*
   workers are still writing the next one. No stalls, no deadlocks.
-- **Time-precise scoring** — the 10-second window is measured with
-  `steady_clock` and fractional throughput is kept, so a CPU that is a
-  fraction of a second faster scores proportionally higher instead of
-  being rounded down to whole frames.
+- **Time-precise scoring** — the frame's exact elapsed time is measured with
+  `steady_clock`, so a CPU that finishes the same work a fraction of a
+  second faster scores proportionally higher instead of being rounded down
+  to whole frames.
 - **Built-in leaderboard** — your run is ranked against reference CPU
   profiles (Ryzen 9 9950X3D, i9-14900K, Ryzen 7 7800X3D, M3 Max,
   i5-13600K) in a single sortable table.
@@ -128,17 +146,20 @@ run it:
 
 1. Start the app — the full-window UI appears with a **Run Benchmark**
    button.
-2. Click **Run Benchmark**. The benchmark renders for exactly 10 seconds
-   while the live preview shows the frame being assembled; the window title
-   tracks frame/tile progress.
-3. When the window closes, the UI shows your score, places you on the
+2. Click **Run Benchmark**. The path tracer renders the single 4K frame
+   (3840×2160, 1024 spp) to completion while the live preview shows the
+   image being assembled; the window title tracks tile progress.
+3. When the render finishes, the UI shows your score, places you on the
    leaderboard, and prints the result to stdout:
 
    ```text
-   LinuxBench: benchmark complete — 10.0 s, 881 frames, score 88100 pts
-   Wrote benchmark.ppm (1920x1080, P6)
+   LinuxBench: benchmark complete — 48.500 s, score 32989 pts
+   Wrote benchmark.ppm (3840x2160, P6)
    Appended result to linuxbench_results.csv
    ```
+
+> **Heads up:** a full 4K frame at 1024 spp is a heavy render — on current
+> desktop hardware expect on the order of a minute or more per run.
 
 ### Headless / CI (`LINUXBENCH_AUTORUN`)
 
@@ -168,35 +189,39 @@ Behavior:
 
 ## Scoring System
 
-The benchmark runs for exactly **10.0 seconds** and counts how many complete
-1920×1080 frames it renders. The score is:
+The benchmark renders **one** path-traced 4K frame — 3840×2160 at 1024
+samples per pixel — to completion. The score is:
 
 ```
-score = frames / exact_elapsed_seconds × 1000
+score = 1,600,000 / exact_elapsed_seconds
 ```
 
-elapsed time is measured with `std::chrono::steady_clock` between the first
-frame start and the window close, so fractional frames per second are kept:
+elapsed time is measured with `std::chrono::steady_clock` between the render
+start and the moment the last tile is provably complete, so fractional
+seconds are kept:
 
-- 880 frames in exactly 10.00 s → **88,000 pts**
-- the same CPU doing 881 frames → **88,100 pts**
+- 48.500 s → **32,989 pts**
+- 46.000 s → **34,782 pts**
+- 44.000 s → **36,363 pts**
 
-This rewards real speed differences instead of rounding them away to whole
+The 1,600,000 numerator scales with the workload (4K × 1024 spp path
+tracing), tuned so a Ryzen 9 9950X3D lands around **33,200 pts**. This
+rewards real speed differences instead of rounding them away to whole
 integer frames.
 
 **How to compare CPUs:** run the same binary, on the same OS, with the same
 number of active threads (LinuxBench uses all cores). Higher score =
 faster CPU. Scores are only comparable across runs of the *same*
-LinuxBench build — the scene, resolution, and shadow workload are fixed
-by the binary, so you don't need to worry about settings drifting.
+LinuxBench build — the scene, resolution, sample count, and bounce depth
+are fixed by the binary, so you don't need to worry about settings drifting.
 
 ### Exported results
 
 | File | Contents |
 |---|---|
 | `linuxbench_results.csv` | `Timestamp, CPU Name, Score, TimeMs` — appended once per run (header written only on the first line) |
-| `benchmark.ppm` | The final rendered frame, 1920×1080, binary P6 |
-| stdout | Human-readable completion line (seconds, frames, score) |
+| `benchmark.ppm` | The final rendered frame, 3840×2160, binary P6 |
+| stdout | Human-readable completion line (seconds, score) |
 
 ## Project Layout
 
@@ -206,14 +231,14 @@ LinuxBench/
 ├── build_appimage.sh       # One-shot AppImage packaging script
 ├── include/
 │   ├── Framebuffer.h       # Double-buffered pixel buffer + PPM export
-│   ├── Scene.h             # Embree scene: BVH build, traceRay()
+│   ├── Scene.h             # Embree scene: BVH build, path-traced traceRay()
 │   ├── ThreadPool.h        # Persistent worker pool
-│   ├── TileDispatcher.h    # 32 px tile work distribution
+│   ├── TileDispatcher.h    # 64 px tile work distribution
 │   └── Vec3.h
 └── src/
     ├── main.cpp            # UI loop, benchmark state machine, scoring, CSV, leaderboard
     ├── Framebuffer.cpp
-    ├── Scene.cpp           # Procedural ~10M-triangle scene + shadow rays
+    ├── Scene.cpp           # Procedural ~10.5M-triangle scene + PBR BSDFs (matte / metal / glass)
     └── TileDispatcher.cpp
 ```
 
