@@ -1,0 +1,43 @@
+# ============================================================================
+# LinuxBench — .gitignore
+# ============================================================================
+
+# --- CMake build tree -------------------------------------------------------
+# Includes the CMake cache, generated Makefiles, object files, and the
+# FetchContent trees (GLFW / ImGui / Embree) under build/_deps.
+build/
+cmake-build-*/
+CMakeUserPresets.json
+
+# --- Compiled objects / libraries -------------------------------------------
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.dylib
+*.dylib.*
+*.exe
+*.pdb
+
+# --- AppImage packaging (build_appimage.sh) ---------------------------------
+# The linuxdeploy tool itself and the produced .AppImage are both artifacts;
+# build_appimage.sh recreates them on demand.
+AppDir/
+*.AppImage
+
+# --- Runtime outputs (written by LinuxBench when a benchmark runs) ----------
+benchmark.ppm
+linuxbench_results.csv
+
+# --- Editor / IDE ------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- OS cruft ----------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
