@@ -157,11 +157,7 @@ run it:
 1. Start the app — the full-window UI appears with two run buttons side by
    side.
 2. Pick a mode:
-   - **Run Benchmark (3 Passes)** — the official scored run: three full
-     passes (3840×2160, 1024 spp each) back-to-back. The UI shows the current
-     pass (`Pass 2 / 3`), the last completed pass's score, and the window
-     title tracks tile progress (title updates are throttled to one per
-     250 ms — no more flicker).
+   - **Run Benchmark (3 Passes)** — the official scored run: three full passes (3840×2160, 1024 spp each) back-to-back. The UI shows the current pass (Pass 2 / 3), the last completed pass's score, and live rendering progress via the on-screen progress bar. The OS window title remains a clean, static "Linux Benchmark" to ensure perfect compatibility with Wayland and modern compositors.
    - **Stress Test (Infinite)** — passes run endlessly (`Stress Test:
      Pass 14`) with the last-pass score updated live after every pass. Pure
      load: nothing is written to CSV or PPM.
