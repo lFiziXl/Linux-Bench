@@ -1,6 +1,6 @@
 # LinuxBench
 
-[![Version](https://img.shields.io/badge/Version-0.2.0-brightgreen?style=for-the-badge)](CMakeLists.txt)
+[![Version](https://img.shields.io/badge/Version-0.3.0-brightgreen?style=for-the-badge)](CMakeLists.txt)
 [![C++20](https://img.shields.io/badge/C%2B%2B-20-blue?style=for-the-badge)](https://isocpp.org)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20x86_64-green?style=for-the-badge)](https://www.linux.org)
 [![Embree](https://img.shields.io/badge/Embree-4.4.1-6ea1c3?style=for-the-badge)](https://embree.github.io)
@@ -26,6 +26,11 @@ real-time frame-rate loop, LinuxBench now performs an offline-style render —
 one massive, physically-based path-traced 4K frame — a workload heavy enough
 to pin a Ryzen 9 9950X3D for a full minute.
 
+v0.3.0 refines the run loop: the scored **benchmark** now renders **three
+passes** back-to-back (each pass re-seeded, so none is a warm-cache repeat of
+the last) and reports one combined score, while the new **stress test** mode
+runs passes endlessly with a live last-pass score until you hit **Stop**.
+
 The whole application is a single native binary: GLFW provides the window
 and OpenGL context, Dear ImGui draws a full-window live UI (progress, score,
 leaderboard), and a persistent worker pool path-traces tiles of the frame
@@ -47,9 +52,14 @@ Electron, no telemetry — just C++20 and your silicon.
 - **Schlick's Fresnel approximation** — glass and metal use Schlick's F(θ)
   to split energy between reflection and refraction, with total internal
   reflection when the refraction angle overflows.
-- **17+ billion ray traversals per run** — 8.5 billion primary rays
+- **3-pass benchmark + stress test** — the scored run renders three full
+  passes back-to-back (per-pass RNG re-seed: `worker_id + 1 + pass × 100`)
+  and reports `score = (1,600,000 × 3) / total time`; the stress mode loops
+  endlessly with a live last-pass score and a red **Stop** button that
+  finishes the in-flight pass cleanly.
+- **17+ billion ray traversals per pass** — 8.5 billion primary rays
   (3840×2160 × 1024 spp) plus secondary GI bounces, each one a full Embree
-  BVH traversal against ~10.5M triangles.
+  BVH traversal against ~10.5M triangles (three passes per benchmark run).
 - **Intel Embree 4.4.1** — hardware-SIMD BVH and intersection kernels
   (ISPC-free, no TBB) for a workload that actually saturates modern CPUs.
 - **Persistent thread pool** — worker threads are created once and reused
@@ -144,22 +154,33 @@ run it:
 
 ### Interactive (desktop)
 
-1. Start the app — the full-window UI appears with a **Run Benchmark**
-   button.
-2. Click **Run Benchmark**. The path tracer renders the single 4K frame
-   (3840×2160, 1024 spp) to completion while the live preview shows the
-   image being assembled; the window title tracks tile progress.
-3. When the render finishes, the UI shows your score, places you on the
-   leaderboard, and prints the result to stdout:
+1. Start the app — the full-window UI appears with two run buttons side by
+   side.
+2. Pick a mode:
+   - **Run Benchmark (3 Passes)** — the official scored run: three full
+     passes (3840×2160, 1024 spp each) back-to-back. The UI shows the current
+     pass (`Pass 2 / 3`), the last completed pass's score, and the window
+     title tracks tile progress (title updates are throttled to one per
+     250 ms — no more flicker).
+   - **Stress Test (Infinite)** — passes run endlessly (`Stress Test:
+     Pass 14`) with the last-pass score updated live after every pass. Pure
+     load: nothing is written to CSV or PPM.
+3. While a run is in flight, the red **Stop** button finishes the current
+   pass cleanly and returns to the idle UI. A completed benchmark shows your
+   score on the leaderboard and prints the result to stdout:
 
    ```text
-   LinuxBench: benchmark complete — 48.500 s, score 32989 pts
+   LinuxBench: pass 1 complete — 48.500 s, 32989 pts/pass
+   LinuxBench: pass 2 complete — 47.900 s, 33402 pts/pass
+   LinuxBench: pass 3 complete — 48.100 s, 33264 pts/pass
+   LinuxBench: benchmark complete — 3 passes, 144.500 s total, score 33218 pts
    Wrote benchmark.ppm (3840x2160, P6)
    Appended result to linuxbench_results.csv
    ```
 
 > **Heads up:** a full 4K frame at 1024 spp is a heavy render — on current
-> desktop hardware expect on the order of a minute or more per run.
+> desktop hardware expect on the order of a minute or more per *pass*, so a
+> complete benchmark takes roughly three times as long.
 
 ### Headless / CI (`LINUXBENCH_AUTORUN`)
 
@@ -189,25 +210,39 @@ Behavior:
 
 ## Scoring System
 
-The benchmark renders **one** path-traced 4K frame — 3840×2160 at 1024
-samples per pixel — to completion. The score is:
+The benchmark renders **three** path-traced 4K frames — each pass is
+3840×2160 at 1024 samples per pixel — back-to-back. Each pass's random
+numbers are re-seeded (`worker_id + 1 + pass × 100`), so every pass sees a
+different noise pattern and none of them is a warm-cache repeat of the
+last.
+
+The score is the work done divided by the time it took:
 
 ```
-score = 1,600,000 / exact_elapsed_seconds
+score = (1,600,000 × 3) / total_elapsed_seconds
 ```
 
-elapsed time is measured with `std::chrono::steady_clock` between the render
-start and the moment the last tile is provably complete, so fractional
-seconds are kept:
+`total_elapsed_seconds` is the sum of the three passes, each measured with
+`std::chrono::steady_clock` between the pass start and the moment its last
+tile is provably complete, so fractional seconds are kept:
 
-- 48.500 s → **32,989 pts**
-- 46.000 s → **34,782 pts**
-- 44.000 s → **36,363 pts**
+- 3 × 48.500 s = 145.500 s → **33,058 pts**
+- 3 × 46.000 s = 138.000 s → **34,782 pts**
+- 3 × 44.000 s = 132.000 s → **36,363 pts**
 
-The 1,600,000 numerator scales with the workload (4K × 1024 spp path
+The 1,600,000 × 3 numerator scales with the workload (3 × 4K × 1024 spp path
 tracing), tuned so a Ryzen 9 9950X3D lands around **33,200 pts**. This
 rewards real speed differences instead of rounding them away to whole
 integer frames.
+
+### Stress test
+
+**Stress Test (Infinite)** runs the same passes endlessly. It is not a
+scored run: nothing is written to CSV or PPM. Instead, the UI shows the
+**last completed pass's** score (`1,600,000 / pass_time`) updated after
+every pass, so you can watch the machine hold — or not — under sustained
+load. The red **Stop** button finishes the in-flight pass cleanly, reports
+the last pass's score, and returns to the idle screen.
 
 **How to compare CPUs:** run the same binary, on the same OS, with the same
 number of active threads (LinuxBench uses all cores). Higher score =
@@ -219,7 +254,7 @@ are fixed by the binary, so you don't need to worry about settings drifting.
 
 | File | Contents |
 |---|---|
-| `linuxbench_results.csv` | `Timestamp, CPU Name, Score, TimeMs` — appended once per run (header written only on the first line) |
+| `linuxbench_results.csv` | `Timestamp, CPU Name, Score, TimeMs` — appended once per completed benchmark run (header written only on the first line; stress tests never log) |
 | `benchmark.ppm` | The final rendered frame, 3840×2160, binary P6 |
 | stdout | Human-readable completion line (seconds, score) |
 
@@ -236,7 +271,7 @@ LinuxBench/
 │   ├── TileDispatcher.h    # 64 px tile work distribution
 │   └── Vec3.h
 └── src/
-    ├── main.cpp            # UI loop, benchmark state machine, scoring, CSV, leaderboard
+    ├── main.cpp            # UI loop, benchmark state machine, 3-pass / stress runs, scoring, CSV, leaderboard
     ├── Framebuffer.cpp
     ├── Scene.cpp           # Procedural ~10.5M-triangle scene + PBR BSDFs (matte / metal / glass)
     └── TileDispatcher.cpp
